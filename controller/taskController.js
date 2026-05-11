@@ -5,7 +5,6 @@ const { emitToUser, emitToGroup } = require("../config/socket");
 const { getRedis } = require("../config/redis");
 const { sendMail } = require("../config/email");
 
-
 // ✅ CREATE TASK
 const createTask = async (req, res) => {
   try {
@@ -23,8 +22,8 @@ const createTask = async (req, res) => {
 
     const creator = await User.findById(req.user._id);
 
-    // 🔥 EMAIL SEND
-    if (assignedTo?.length) {
+    // Email send
+    if (assignedTo && assignedTo.length) {
       const users = await User.find({ _id: { $in: assignedTo } });
 
       for (const user of users) {
@@ -50,11 +49,12 @@ const createTask = async (req, res) => {
 
     res.status(201).json(apiResponse(true, "Task created", task));
   } catch (error) {
+    console.error(error);
     res.status(500).json(apiResponse(false, error.message));
   }
 };
 
-
+// ✅ GET ALL TASKS
 const getTasks = async (req, res) => {
   try {
     const redis = getRedis();
@@ -73,12 +73,12 @@ const getTasks = async (req, res) => {
 
     res.json(apiResponse(true, "DB data", tasks));
   } catch (error) {
+    console.error(error);
     res.status(500).json(apiResponse(false, error.message));
   }
 };
 
-
-
+// ✅ GET TASK BY ID
 const getTaskById = async (req, res) => {
   try {
     const task = await Task.findById(req.params.id).populate("assignedTo");
@@ -89,11 +89,12 @@ const getTaskById = async (req, res) => {
 
     res.json(apiResponse(true, "Task fetched", task));
   } catch (error) {
+    console.error(error);
     res.status(500).json(apiResponse(false, error.message));
   }
 };
 
-
+// ✅ UPDATE TASK
 const updateTask = async (req, res) => {
   try {
     const updatedTask = await Task.findByIdAndUpdate(
@@ -107,11 +108,10 @@ const updateTask = async (req, res) => {
 
     res.json(apiResponse(true, "Task updated", updatedTask));
   } catch (error) {
+    console.error(error);
     res.status(500).json(apiResponse(false, error.message));
   }
 };
-
-
 
 // ✅ DELETE TASK
 const deleteTask = async (req, res) => {
@@ -123,9 +123,12 @@ const deleteTask = async (req, res) => {
 
     res.json(apiResponse(true, "Task deleted"));
   } catch (error) {
+    console.error(error);
     res.status(500).json(apiResponse(false, error.message));
   }
 };
+
+// ✅ UPDATE TASK STATUS (with null check fix)
 const updateTaskStatus = async (req, res) => {
   try {
     const { status } = req.body;
@@ -141,14 +144,22 @@ const updateTaskStatus = async (req, res) => {
     if (task.type === 'group' && task.groupId) {
       const Group = require("../model/groupModel");
       const group = await Group.findById(task.groupId);
-      const isMember = group.participants.some(
-        p => p.user.toString() === req.user._id.toString()
+      
+      // ✅ NULL CHECK - FIX FOR THE ERROR
+      if (!group) {
+        return res.status(404).json(apiResponse(false, 'Group not found for this task'));
+      }
+      
+      // ✅ Check if participants exists and user is a member
+      const isMember = group.participants && group.participants.some(
+        p => p.user && p.user.toString() === req.user._id.toString()
       );
+      
       if (!isMember) {
-        return res.status(403).json(apiResponse(false, 'Not authorized'));
+        return res.status(403).json(apiResponse(false, 'You are not a member of this group'));
       }
     } else if (task.createdBy.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
-      return res.status(403).json(apiResponse(false, 'Not authorized'));
+      return res.status(403).json(apiResponse(false, 'Not authorized to update this task'));
     }
 
     task.status = status;
@@ -171,11 +182,12 @@ const updateTaskStatus = async (req, res) => {
 
     res.json(apiResponse(true, 'Task status updated', task));
   } catch (error) {
-    console.error(error);
+    console.error('Update task status error:', error);
     res.status(500).json(apiResponse(false, error.message));
   }
 };
 
+// ✅ REORDER TASKS
 const reorderTasks = async (req, res) => {
   try {
     const { tasks } = req.body; // Array of task ids in order
@@ -195,7 +207,7 @@ const reorderTasks = async (req, res) => {
   }
 };
 
-// Make sure to update the module.exports
+// ✅ EXPORT ALL FUNCTIONS
 module.exports = {
   createTask,
   getTasks,
