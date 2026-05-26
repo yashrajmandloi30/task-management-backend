@@ -4,6 +4,7 @@ const apiResponse = require("../config/apiResponse");
 const { emitToUser, emitToGroup } = require("../config/socket");
 const { getRedis } = require("../config/redis");
 const { sendMail } = require("../config/email");
+const Group  = require("../model/groupModel");
 
 // ✅ CREATE TASK
 const createTask = async (req, res) => {
@@ -105,21 +106,35 @@ const createTask = async (req, res) => {
 // ✅ GET ALL TASKS
 const getTasks = async (req, res) => {
   try {
-    const redis = getRedis();
-    const cacheKey = "tasks:all";
+    const userId = req.user._id;
+    const userRole = req.user.role;
 
-    const cached = await redis.get(cacheKey);
-    if (cached) {
-      return res.json(apiResponse(true, "From cache", JSON.parse(cached)));
+    let query = {};
+
+    if (userRole !== 'admin') {
+      // Get all groups where user is a participant
+      const userGroups = await Group.find({ "participants.user": userId }).select("_id");
+      const groupIds = userGroups.map(g => g._id);
+
+      query = {
+        $or: [
+          { assignedTo: userId },                     // personal task assigned to user
+          { type: "group", groupId: { $in: groupIds } } // group task where user is in the group
+        ]
+      };
     }
 
-    const tasks = await Task.find()
+    const tasks = await Task.find(query)
       .populate("assignedTo", "name email")
+      .populate("createdBy", "name email")
       .sort({ createdAt: -1 });
 
+    // Cache per user (optional, skip if causing issues)
+    const redis = getRedis();
+    const cacheKey = `tasks:user:${userId}`;
     await redis.set(cacheKey, JSON.stringify(tasks), { EX: 60 });
 
-    res.json(apiResponse(true, "DB data", tasks));
+    res.json(apiResponse(true, "Tasks fetched", tasks));
   } catch (error) {
     console.error(error);
     res.status(500).json(apiResponse(false, error.message));
@@ -188,71 +203,73 @@ const updateTaskStatus = async (req, res) => {
     const { status } = req.body;
     const taskId = req.params.id;
 
-    const task = await Task.findById(taskId).populate('assignedTo', 'name email');
+    const task = await Task.findById(taskId).populate('assignedTo', '_id');
     if (!task) return res.status(404).json(apiResponse(false, 'Task not found'));
-    
-    if (task.status === 'completed') {
-  return res.status(403).json(apiResponse(false, 'Completed tasks cannot be changed'));
-}
 
-    const user = req.user; // from authMiddleware
+    const user = req.user;
     const isAdmin = user.role === 'admin';
     const isAssigned = task.assignedTo.some(u => u._id.toString() === user._id.toString());
 
-    // 1. Deadline check (if passed, block all status changes)
+    // Only admin or assigned user can update
+    if (!isAdmin && !isAssigned) {
+      return res.status(403).json(apiResponse(false, 'Not authorized'));
+    }
+
+    // Deadline check
     const now = new Date();
     const deadline = task.deadline ? new Date(task.deadline) : null;
     if (deadline && deadline < now && task.status !== 'completed') {
       return res.status(403).json(apiResponse(false, 'Task deadline has passed. Cannot change status.'));
     }
 
-    // 2. Status transition rules
     const oldStatus = task.status;
-    const newStatus = status;
 
-    // Define allowed transitions
-    const allowedTransitions = {
+    // Define allowed transitions for non-admin assigned user
+    const allowedForUser = {
       pending: ['in-progress'],
-      'in-progress': ['pending', 'review'],
-      review: ['in-progress'],   // only admin can move review -> completed later
-      completed: []               // once completed, cannot change (or only admin can revert? We'll keep it strict)
+      'in-progress': ['review'],
+      review: [],        // cannot move from review
+      completed: []      // cannot move completed
     };
 
-    // Special case: moving to 'completed' only by admin
-    if (newStatus === 'completed') {
-      if (!isAdmin) {
-        return res.status(403).json(apiResponse(false, 'Only admin can mark task as completed'));
-      }
-      // Admin can complete from any status except maybe already completed
+    // Admin can move any non‑completed task to any status (including completed)
+    if (isAdmin) {
       if (oldStatus === 'completed') {
-        return res.status(400).json(apiResponse(false, 'Task is already completed'));
+        return res.status(403).json(apiResponse(false, 'Completed tasks cannot be changed'));
       }
-    } 
-    // For non-completed status changes, check allowed transitions
-    else {
-      // Normal user can only move within allowedTransitions[oldStatus]
-      if (!isAdmin && !allowedTransitions[oldStatus]?.includes(newStatus)) {
-        return res.status(403).json(apiResponse(false, `Cannot move from ${oldStatus} to ${newStatus}`));
+      // Admin allowed any status
+    } else {
+      // Non-admin: check allowed transitions
+      if (!allowedForUser[oldStatus] || !allowedForUser[oldStatus].includes(status)) {
+        return res.status(403).json(apiResponse(false, `Cannot move from ${oldStatus} to ${status}`));
       }
-      // Admin can move any non-completed status freely (except maybe to completed handled above)
-      // No extra restriction for admin
     }
 
-    task.status = newStatus;
+    // Only admin can move to completed
+    if (status === 'completed' && !isAdmin) {
+      return res.status(403).json(apiResponse(false, 'Only admin can mark task as completed'));
+    }
+
+    task.status = status;
     await task.save();
 
-    // Invalidate cache & emit socket events...
+    const updatedTask = await Task.findById(taskId)
+      .populate('assignedTo', 'name email')
+      .populate('createdBy', 'name email');
+
+    // Clear cache & emit socket events
     const redis = getRedis();
     await redis.del("tasks:all");
+    await redis.del(`tasks:user:${user._id}`);
 
     if (task.type === 'group' && task.groupId) {
-      emitToGroup(task.groupId, 'task-status-updated', task);
+      emitToGroup(task.groupId, 'task-status-updated', updatedTask);
     } else {
-      task.assignedTo.forEach(u => emitToUser(u._id, 'task-status-updated', task));
-      emitToUser(task.createdBy, 'task-status-updated', task);
+      task.assignedTo.forEach(u => emitToUser(u._id, 'task-status-updated', updatedTask));
+      emitToUser(task.createdBy, 'task-status-updated', updatedTask);
     }
 
-    res.json(apiResponse(true, 'Task status updated', task));
+    res.json(apiResponse(true, 'Task status updated', updatedTask));
   } catch (error) {
     console.error(error);
     res.status(500).json(apiResponse(false, error.message));

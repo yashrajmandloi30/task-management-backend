@@ -31,7 +31,7 @@ app.use(cors({
 // Middlewares
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-app.get("/me" , authMiddleware, getCurrentUser)
+app.get("/api/me" , authMiddleware, getCurrentUser)
 // Routes - Note the /api prefix
 app.use("/api/user", userRoute);
 app.use("/api/task", taskRoute);
